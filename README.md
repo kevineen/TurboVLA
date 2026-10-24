@@ -107,6 +107,19 @@ pip install flash-attn==2.7.4.post1 --no-build-isolation
 
 Install the [RoboTwin 2.0](https://github.com/robotwin-Platform/RoboTwin) simulator in a separate evaluation environment when required by your setup.
 
+### Local workspace setup (so101 branch, uv)
+
+This workspace does **not** use conda. The working environment is `.venv310` (Python 3.10 — deepspeed for training does not run on 3.13):
+
+```bash
+uv venv --python 3.10 .venv310
+uv pip install -e ".[robotwin]" --python .venv310/bin/python
+source .venv310/bin/activate
+export PYTHONPATH=$PWD:$PWD/third_party/starvla_runtime
+```
+
+Checkpoint retention policy (2026-10-24 cleanup): only `final_model/` and the highest `steps_*` checkpoint are kept per run under `results/Checkpoints/`; earlier intermediate steps were deleted.
+
 ---
 
 ## 📦 Dataset and Model Preparation
