@@ -340,7 +340,7 @@ class TurboVLAFramework(baseframework):
         )
         return instructions, {"dinov3": pixel_values}, states
 
-    def forward(self, examples: List[dict] = None, **kwargs):
+    def forward(self, examples: List[dict] = None, reduction: str = "mean", **kwargs):
         del kwargs
         instructions, samples, states = self._model_inputs(examples)
         predicted = self.model(instructions, samples, states)
@@ -350,12 +350,16 @@ class TurboVLAFramework(baseframework):
             dtype=predicted.dtype,
         )[:, -self.action_horizon :]
         if self.loss_type == "mse":
-            loss = F.mse_loss(predicted, targets)
+            losses = F.mse_loss(predicted, targets, reduction="none")
         elif self.loss_type in {"smooth_l1", "huber"}:
-            loss = F.smooth_l1_loss(predicted, targets)
+            losses = F.smooth_l1_loss(predicted, targets, reduction="none")
         else:
-            loss = F.l1_loss(predicted, targets)
-        return {"action_loss": loss}
+            losses = F.l1_loss(predicted, targets, reduction="none")
+        if reduction == "none":
+            # (B, T, D) -> (B,): per-sample loss for GR-BC weighted SFT
+            per_sample_loss = losses.mean(dim=tuple(range(1, losses.ndim)))
+            return {"action_loss": per_sample_loss.mean(), "per_sample_loss": per_sample_loss}
+        return {"action_loss": losses.mean()}
 
     @torch.inference_mode()
     def predict_action(self, examples: List[dict], **kwargs):

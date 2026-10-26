@@ -35,6 +35,7 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
+from starVLA.training.grbc_weights import GRBCWeights, weighted_loss
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, normalize_dotlist_args
 
@@ -142,6 +143,40 @@ class VLATrainer(TrainerUtils):
 
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        self.grbc = self._init_grbc()
+
+    def _init_grbc(self):
+        """Opt-in GR-BC weighted SFT (config block `trainer.grbc.*`)."""
+        grbc_cfg = getattr(self.config.trainer, "grbc", None)
+        if grbc_cfg is None or not bool(grbc_cfg.get("enable", False)):
+            return None
+        provider = GRBCWeights(
+            grbc_cfg.get("weights_path"),
+            column=grbc_cfg.get("weight_column", "graph_transition_weight"),
+            reduction=grbc_cfg.get("reduction", "mean"),
+            device=str(self.accelerator.device),
+        )
+        action_horizon = getattr(self.model, "action_horizon", None)
+        if action_horizon is not None:
+            provider.validate_horizon(action_horizon)
+        self._grbc_validate_coverage(provider)
+        logger.info(
+            f"GRBC: precomputed graph weights from {grbc_cfg.weights_path}, "
+            f"reduction={provider.reduction}; no reward network"
+        )
+        return provider
+
+    def _grbc_validate_coverage(self, provider):
+        """Every trainable frame index must exist in the weight table (single-dataset mixtures)."""
+        mixture = self.vla_train_dataloader.dataset
+        datasets = getattr(mixture, "datasets", None) or [mixture]
+        if len(datasets) > 1:
+            raise ValueError("GR-BC weighted SFT currently supports single-dataset mixtures only")
+        ds = datasets[0]
+        all_indices = np.concatenate(
+            [ds.get_trajectory_data(trajectory_id)["index"].to_numpy() for trajectory_id in ds.trajectory_ids]
+        )
+        provider.validate_indices(all_indices)
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -406,13 +441,30 @@ class VLATrainer(TrainerUtils):
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
+        grbc = getattr(self, "grbc", None)
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
+            if grbc is None:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    output_dict = self.model.forward(batch_vla)
+                    action_loss = output_dict["action_loss"]
+                    total_loss = action_loss
+                metrics = {"action_loss": action_loss.item()}
+            else:
+                weights, grbc_stats = grbc.compute_batch_weights(batch_vla)
+                total_weight = self.accelerator.reduce(weights.sum().to(self.accelerator.device), reduction="sum")
+                if float(total_weight.item()) <= 0.0:
+                    # GR-BC all-zero batch: leave optimizer and scheduler state untouched
+                    return {"action_loss": 0.0, "grbc_skipped_all_zero": 1, **grbc_stats}
+
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    output_dict = self.model.forward(batch_vla, reduction="none")
+                    total_loss = weighted_loss(
+                        output_dict["per_sample_loss"], weights, self.accelerator, grbc.reduction
+                    )
                 action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                metrics = {"action_loss": action_loss.item(), "grbc_skipped_all_zero": 0, **grbc_stats}
 
             self.accelerator.backward(total_loss)
 
@@ -422,9 +474,7 @@ class VLATrainer(TrainerUtils):
             self.optimizer.step()
             self.lr_scheduler.step()
 
-        return {
-            "action_loss": action_loss.item(),
-        }
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""

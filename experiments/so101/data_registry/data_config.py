@@ -74,4 +74,8 @@ DATASET_NAMED_MIXTURES = {
     "cobra_silver_bowl": [
         ("so101_singlearm_pickup_cobra_rgb_20261020_225627", 1.0, "so101"),
     ],
+    # GR-BC wiring smoke (synthetic 2-view pool under ~/robot/datasets; disposable).
+    "grbc_smoke": [
+        ("grbc_smoke_v3", 1.0, "so101"),
+    ],
 }

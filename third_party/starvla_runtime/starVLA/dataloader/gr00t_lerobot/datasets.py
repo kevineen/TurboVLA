@@ -1425,6 +1425,11 @@ class LeRobotSingleDataset(Dataset):
             state = np.concatenate(state, axis=1).astype(np.float16)
             sample["state"] = state
 
+        if self.data_cfg is not None and self.data_cfg.get("include_index", False) not in ["False", False]:
+            if not hasattr(self, "_sample_global_index"):
+                raise RuntimeError("include_index=True requires get_step_data() to run first")
+            sample["index"] = int(self._sample_global_index)
+
         return sample
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
@@ -1456,6 +1461,15 @@ class LeRobotSingleDataset(Dataset):
         data = {}
         # Get the data for all modalities # just for action base data
         self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+        # GR-BC opt-in: stash the chunk-start global frame index for weight lookup.
+        # Must run after get_trajectory_data so curr_traj_data is populated.
+        if self.data_cfg is not None and self.data_cfg.get("include_index", False) not in ["False", False]:
+            if "index" not in self.curr_traj_data.columns:
+                raise ValueError(
+                    "include_index=True requires a global 'index' column in the data parquet "
+                    f"(dataset {getattr(self, 'dataset_name', '?')}); use a LeRobot v3.0 dataset"
+                )
+            self._sample_global_index = int(self.curr_traj_data["index"].iloc[base_index])
         # TODO @JinhuiYE The logic below is poorly implemented. Data reading should be directly based on curr_traj_data.
         for modality in self.modality_keys:
             # Get the data corresponding to each key in the modality
